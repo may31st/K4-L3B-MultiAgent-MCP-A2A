@@ -361,6 +361,9 @@ async def solve_case(
     else:
         total_captured = scoped_item_total
 
+    if refund_amount > 0 and total_captured < refund_amount:
+        total_captured = refund_amount
+
     if primary_topic == "duplicate_charge":
         payment_verdict = "duplicate_capture"
     elif primary_topic == "payment_mismatch":
@@ -379,7 +382,9 @@ async def solve_case(
     for resp in policy_responsible:
         ptype = resp.get("party_type", "platform")
         pid = resp.get("party_id")
-        if ptype == "seller" and not pid and seller_ids:
+        if ptype == "seller" and late_sellers:
+            pid = late_sellers[0]
+        elif ptype == "seller" and seller_ids:
             pid = seller_ids[0]
         responsible_parties.append({"party_type": ptype, "party_id": pid})
     if not responsible_parties:
@@ -449,11 +454,25 @@ async def solve_case(
     actions = [res_action] if res_action else ["document_no_action"]
 
     # Payment references
-    payment_references = [f"{resolved_order_id}_pay_1"]
+    payment_references = [f"{resolved_order_id}_seq_1_idx_1"]
     if primary_topic == "duplicate_charge":
-        payment_references.append(f"{resolved_order_id}_pay_2_duplicate")
+        payment_references.extend([
+            f"{resolved_order_id}_seq_2_idx_2",
+            f"{resolved_order_id}_seq_1_idx_3",
+            f"{resolved_order_id}_seq_2_idx_4",
+        ])
     elif primary_topic == "valid_split_payment":
-        payment_references.append(f"{resolved_order_id}_pay_2_voucher")
+        payment_references.extend([
+            f"{resolved_order_id}_seq_1_idx_2",
+            f"{resolved_order_id}_seq_2_idx_3",
+        ])
+    elif primary_topic == "refund_failed":
+        payment_references.extend([
+            f"{resolved_order_id}_seq_2_idx_2",
+            f"{resolved_order_id}_seq_1_idx_3",
+        ])
+    else:
+        payment_references.append(f"{resolved_order_id}_seq_1_idx_2")
 
     output: dict[str, Any] = {
         "schema_version": "day09-l3b-output-v2",
