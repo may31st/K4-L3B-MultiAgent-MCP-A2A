@@ -50,7 +50,7 @@ async def _run(root: Path) -> None:
     for idx, case_id in enumerate(case_set.case_ids, 1):
         print(f"[{idx:03d}/{total_cases}] Solving {case_id}...", flush=True)
         case = case_set.cases[case_id]
-        for attempt in range(1, 4):
+        for attempt in range(1, 7):
             try:
                 async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
                     trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
@@ -67,10 +67,10 @@ async def _run(root: Path) -> None:
                     trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
                     break
             except Exception as exc:
-                if attempt == 3:
+                if attempt == 6:
                     raise
-                print(f"Warning: {case_id} attempt {attempt} failed ({exc}). Retrying...", flush=True)
-                await asyncio.sleep(2.0)
+                print(f"Warning: {case_id} attempt {attempt} failed ({exc}). Retrying in {attempt * 2.5:.1f}s...", flush=True)
+                await asyncio.sleep(attempt * 2.5)
 
 
 def parser() -> argparse.ArgumentParser:
