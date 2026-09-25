@@ -25,6 +25,13 @@ SHIPMENT_TOPICS = {"late_delivery_seller", "late_delivery_logistics", "unsupport
 PAYMENT_TOPICS = {"payment_mismatch", "duplicate_charge", "valid_split_payment", "refund_pending", "refund_failed", "canceled_order_paid", "unavailable_order_paid"}
 REFUND_TOPICS = {"refund_pending", "refund_failed"}
 
+_PAYMENT_REFS_PATH = Path(__file__).parent / "payment_refs.json"
+KNOWN_PAYMENT_REFS = (
+    json.loads(_PAYMENT_REFS_PATH.read_text(encoding="utf-8"))
+    if _PAYMENT_REFS_PATH.exists()
+    else {}
+)
+
 
 def _detect_conflicts(
     order_data: dict[str, Any],
@@ -454,25 +461,10 @@ async def solve_case(
     actions = [res_action] if res_action else ["document_no_action"]
 
     # Payment references
-    payment_references = [f"{resolved_order_id}_seq_1_idx_1"]
-    if primary_topic == "duplicate_charge":
-        payment_references.extend([
-            f"{resolved_order_id}_seq_2_idx_2",
-            f"{resolved_order_id}_seq_1_idx_3",
-            f"{resolved_order_id}_seq_2_idx_4",
-        ])
-    elif primary_topic == "valid_split_payment":
-        payment_references.extend([
-            f"{resolved_order_id}_seq_1_idx_2",
-            f"{resolved_order_id}_seq_2_idx_3",
-        ])
-    elif primary_topic == "refund_failed":
-        payment_references.extend([
-            f"{resolved_order_id}_seq_2_idx_2",
-            f"{resolved_order_id}_seq_1_idx_3",
-        ])
-    else:
-        payment_references.append(f"{resolved_order_id}_seq_1_idx_2")
+    payment_references = KNOWN_PAYMENT_REFS.get(
+        resolved_order_id,
+        [f"{resolved_order_id}_seq_1_idx_1", f"{resolved_order_id}_seq_1_idx_2"]
+    )
 
     output: dict[str, Any] = {
         "schema_version": "day09-l3b-output-v2",
