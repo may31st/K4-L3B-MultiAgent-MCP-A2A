@@ -1,1 +1,0 @@
-{"schema_version":"day09-trace-event-v1","event_id":"evt_1QM1XV6JRVg1OpXKTYavxzvG","case_id":"L3B_CASE_001","event_type":"task_assigned","occurred_at":"2026-09-25T10:51:39.822038Z","actor":"coordinator","target":"entity_agent","attributes":{"task":"resolve_entity_and_customer_context"}}
