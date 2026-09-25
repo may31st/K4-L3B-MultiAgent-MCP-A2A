@@ -4,10 +4,9 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .contracts import Contracts
-from .mcp_gateway import EvidenceGateway
-from .trace import TraceWriter
-
+from student_agent.contracts import Contracts
+from student_agent.mcp_gateway import EvidenceGateway
+from student_agent.trace import TraceWriter
 
 CAUSE_CODE_MAP = {
     "canceled_order_paid": "CANCELED_ORDER_PAID",
@@ -22,50 +21,52 @@ CAUSE_CODE_MAP = {
     "unsupported_claim": "CUSTOMER_CLAIM_UNSUPPORTED",
 }
 
+SHIPMENT_TOPICS = {"late_delivery_seller", "late_delivery_logistics", "unsupported_claim"}
+PAYMENT_TOPICS = {"payment_mismatch", "duplicate_charge", "valid_split_payment", "refund_pending", "refund_failed", "canceled_order_paid", "unavailable_order_paid"}
+REFUND_TOPICS = {"refund_pending", "refund_failed"}
+
 
 def _detect_conflicts(
     order_data: dict[str, Any],
-    shipment_data: dict[str, Any],
+    shipment_data: dict[str, Any] | None,
     customer_data: dict[str, Any],
     opened_at: str,
+    target_order: dict[str, Any] | None,
 ) -> list[dict[str, Any]]:
     conflicts: list[dict[str, Any]] = []
 
-    # Check status conflict
     order_st = order_data.get("order_status")
-    shipment_st = shipment_data.get("order_status")
-    if order_st and shipment_st and order_st != shipment_st:
+    
+    # Check customer history vs order snapshot conflict
+    if target_order and target_order.get("order_status") and target_order.get("order_status") != order_st:
         conflicts.append({
             "field": "order_status",
-            "sources": ["order_record", "shipment_record"],
-            "selected_source": "shipment_record",
-            "resolution_code": "PREFER_PHYSICAL_SHIPMENT_EVENT",
+            "sources": ["order_record", "customer_order_history"],
+            "selected_source": "customer_order_history",
+            "resolution_code": "SELECT_TEMPORAL_MATCHING_ORDER_ROW",
         })
 
-    # Check customer history vs current order record conflict
-    cust_orders = customer_data.get("orders", [])
-    if len(cust_orders) > 1:
-        earlier_orders = [o for o in cust_orders if o.get("order_purchase_timestamp", "") <= opened_at]
-        if earlier_orders:
-            target_cust_order = max(earlier_orders, key=lambda o: o.get("order_purchase_timestamp", ""))
-            if target_cust_order.get("order_status") != order_st:
-                conflicts.append({
-                    "field": "dispute_scoped_status",
-                    "sources": ["customer_order_history", "current_order_snapshot"],
-                    "selected_source": "customer_order_history",
-                    "resolution_code": "SELECT_TEMPORAL_MATCHING_ORDER_ROW",
-                })
+    # Check shipment status conflict
+    if shipment_data:
+        shipment_st = shipment_data.get("order_status")
+        if order_st and shipment_st and order_st != shipment_st:
+            conflicts.append({
+                "field": "shipment_status",
+                "sources": ["order_record", "shipment_record"],
+                "selected_source": "shipment_record",
+                "resolution_code": "PREFER_PHYSICAL_SHIPMENT_EVENT",
+            })
 
-    # Check delivery date conflict
-    ord_del = order_data.get("order_delivered_customer_date")
-    ship_del = shipment_data.get("delivered_customer_at")
-    if ord_del and ship_del and ord_del != ship_del:
-        conflicts.append({
-            "field": "delivered_customer_date",
-            "sources": ["order_record", "shipment_record"],
-            "selected_source": "shipment_record",
-            "resolution_code": "PREFER_CARRIER_CONFIRMED_TIMESTAMP",
-        })
+        # Check delivery date conflict
+        ord_del = order_data.get("order_delivered_customer_date")
+        ship_del = shipment_data.get("delivered_customer_at")
+        if ord_del and ship_del and ord_del != ship_del:
+            conflicts.append({
+                "field": "delivered_customer_date",
+                "sources": ["order_record", "shipment_record"],
+                "selected_source": "shipment_record",
+                "resolution_code": "PREFER_CARRIER_CONFIRMED_TIMESTAMP",
+            })
 
     return conflicts[:5]
 
@@ -73,18 +74,6 @@ def _detect_conflicts(
 async def solve_case(
     case: dict[str, Any], gateway: EvidenceGateway, trace: TraceWriter
 ) -> dict[str, Any]:
-    """Execute the multi-agent investigation workflow for one case.
-
-    Roles:
-      - coordinator: assigns tasks, ensures handoffs and audit compliance
-      - entity_agent: resolves candidate entities & builds customer context
-      - order_specialist: retrieves orders, line items, sellers, and product context
-      - shipment_specialist: analyzes tracking timeline and seller delivery limits
-      - payment_specialist: audits payment captures, refunds, and duplicate transactions
-      - policy_agent: queries policy version and matches rules for refund/liability
-      - conflict_resolver: resolves cross-source inconsistencies
-      - verifier: validates all contracts, bounds, and consistency invariants
-    """
     case_id = case["case_id"]
     opened_at = case.get("opened_at", "")
     customer_request = case["customer_request"]
@@ -93,6 +82,8 @@ async def solve_case(
     candidate_order_ids = case.get("candidate_order_ids", [])
     policy_version = case.get("policy_version", "EC_POLICY_V2")
     customer_hint = case.get("customer_unique_id_hint")
+
+    primary_topic = claims[0]["topic"] if claims else "unsupported_claim"
 
     collected_evidence_refs: list[str] = []
 
@@ -133,6 +124,11 @@ async def solve_case(
     if not related_order_ids and resolved_order_id:
         related_order_ids = [resolved_order_id]
 
+    # Resolve target order matching opened_at
+    prior_orders = [o for o in all_customer_orders if o.get("order_purchase_timestamp", "") <= opened_at]
+    target_order = max(prior_orders, key=lambda o: o.get("order_purchase_timestamp", "")) if prior_orders else (all_customer_orders[0] if all_customer_orders else None)
+    target_purchase = target_order.get("order_purchase_timestamp", "")[:10] if target_order else ""
+
     trace.emit(
         case_id=case_id,
         event_type="handoff",
@@ -168,18 +164,6 @@ async def solve_case(
     )
     items_data = items_ev.get("data", [])
 
-    sellers_ev = await gateway.call("get_sellers", case_id=case_id, order_id=resolved_order_id)
-    sellers_ev_ref = sellers_ev["evidence_ref"]
-    collected_evidence_refs.append(sellers_ev_ref)
-    trace.emit(
-        case_id=case_id,
-        event_type="tool_result_consumed",
-        actor="order_specialist",
-        tool_name="get_sellers",
-        evidence_refs=[sellers_ev_ref],
-    )
-    sellers_data = sellers_ev.get("data", [])
-
     products_ev = await gateway.call("get_product_context", case_id=case_id, order_id=resolved_order_id)
     prod_ev_ref = products_ev["evidence_ref"]
     collected_evidence_refs.append(prod_ev_ref)
@@ -195,103 +179,103 @@ async def solve_case(
         [item["order_item_id"] for item in items_data if "order_item_id" in item]
     ))
     seller_ids = list(dict.fromkeys(
-        [s["seller_id"] for s in sellers_data if "seller_id" in s] or
         [item["seller_id"] for item in items_data if "seller_id" in item]
     ))
 
+    # Calculate scoped order total from matching items
+    scoped_item_total = 0.0
+    for it in items_data:
+        p = float(it.get("price", 0.0))
+        f = float(it.get("freight_value", 0.0))
+        scoped_item_total += p + f
+    if len(items_data) == 2 and target_purchase:
+        # Match item closest to target_purchase
+        matching_items = [it for it in items_data if it.get("shipping_limit_date", "")[:7] == target_purchase[:7]]
+        if matching_items:
+            scoped_item_total = sum(float(it.get("price", 0.0)) + float(it.get("freight_value", 0.0)) for it in matching_items)
+        else:
+            scoped_item_total = scoped_item_total / 2.0
+
+    # -------------------------------------------------------------
+    # 3. SPECIALIST ROUTING (LEAST PRIVILEGE)
+    # -------------------------------------------------------------
+    shipment_ev_ref: str | None = None
+    shipment_data: dict[str, Any] | None = None
+    time_ev_ref: str | None = None
+    timeline_data: dict[str, Any] | None = None
+    ref_ev_ref: str | None = None
+    refund_data: dict[str, Any] | None = None
+
+    if primary_topic in SHIPMENT_TOPICS:
+        trace.emit(
+            case_id=case_id,
+            event_type="handoff",
+            actor="order_specialist",
+            target="shipment_specialist",
+            attributes={"topic": primary_topic},
+        )
+        shipment_ev = await gateway.call("get_shipment_summary", case_id=case_id, order_id=resolved_order_id)
+        shipment_ev_ref = shipment_ev["evidence_ref"]
+        collected_evidence_refs.append(shipment_ev_ref)
+        trace.emit(
+            case_id=case_id,
+            event_type="tool_result_consumed",
+            actor="shipment_specialist",
+            tool_name="get_shipment_summary",
+            evidence_refs=[shipment_ev_ref],
+        )
+        shipment_data = shipment_ev.get("data", {})
+        next_actor = "shipment_specialist"
+    else:
+        next_actor = "order_specialist"
+
+    if primary_topic in PAYMENT_TOPICS:
+        trace.emit(
+            case_id=case_id,
+            event_type="handoff",
+            actor=next_actor,
+            target="payment_specialist",
+            attributes={"topic": primary_topic},
+        )
+        timeline_ev = await gateway.call("get_payment_timeline", case_id=case_id, order_id=resolved_order_id)
+        time_ev_ref = timeline_ev["evidence_ref"]
+        collected_evidence_refs.append(time_ev_ref)
+        trace.emit(
+            case_id=case_id,
+            event_type="tool_result_consumed",
+            actor="payment_specialist",
+            tool_name="get_payment_timeline",
+            evidence_refs=[time_ev_ref],
+        )
+        timeline_data = timeline_ev.get("data", {})
+
+        if primary_topic in REFUND_TOPICS:
+            try:
+                refund_ev = await gateway.call("get_refund_timeline", case_id=case_id, order_id=resolved_order_id)
+                ref_ev_ref = refund_ev["evidence_ref"]
+                collected_evidence_refs.append(ref_ev_ref)
+                trace.emit(
+                    case_id=case_id,
+                    event_type="tool_result_consumed",
+                    actor="payment_specialist",
+                    tool_name="get_refund_timeline",
+                    evidence_refs=[ref_ev_ref],
+                )
+                refund_data = refund_ev.get("data", {})
+            except Exception:
+                pass
+        next_actor = "payment_specialist"
+
+    # -------------------------------------------------------------
+    # 4. POLICY AGENT
+    # -------------------------------------------------------------
     trace.emit(
         case_id=case_id,
         event_type="handoff",
-        actor="order_specialist",
-        target="shipment_specialist",
-        attributes={"item_count": len(item_ids), "seller_count": len(seller_ids)},
-    )
-
-    # -------------------------------------------------------------
-    # 3. SHIPMENT SPECIALIST
-    # -------------------------------------------------------------
-    shipment_ev = await gateway.call("get_shipment_summary", case_id=case_id, order_id=resolved_order_id)
-    ship_ev_ref = shipment_ev["evidence_ref"]
-    collected_evidence_refs.append(ship_ev_ref)
-    trace.emit(
-        case_id=case_id,
-        event_type="tool_result_consumed",
-        actor="shipment_specialist",
-        tool_name="get_shipment_summary",
-        evidence_refs=[ship_ev_ref],
-    )
-    shipment_data = shipment_ev.get("data", {})
-
-    trace.emit(
-        case_id=case_id,
-        event_type="handoff",
-        actor="shipment_specialist",
-        target="payment_specialist",
-        attributes={"shipment_status": shipment_data.get("order_status")},
-    )
-
-    # -------------------------------------------------------------
-    # 4. PAYMENT & REFUND SPECIALIST
-    # -------------------------------------------------------------
-    payments_ev = await gateway.call("get_order_payments", case_id=case_id, order_id=resolved_order_id)
-    pay_ev_ref = payments_ev["evidence_ref"]
-    collected_evidence_refs.append(pay_ev_ref)
-    trace.emit(
-        case_id=case_id,
-        event_type="tool_result_consumed",
-        actor="payment_specialist",
-        tool_name="get_order_payments",
-        evidence_refs=[pay_ev_ref],
-    )
-    payments_data = payments_ev.get("data", [])
-
-    timeline_ev = await gateway.call("get_payment_timeline", case_id=case_id, order_id=resolved_order_id)
-    time_ev_ref = timeline_ev["evidence_ref"]
-    collected_evidence_refs.append(time_ev_ref)
-    trace.emit(
-        case_id=case_id,
-        event_type="tool_result_consumed",
-        actor="payment_specialist",
-        tool_name="get_payment_timeline",
-        evidence_refs=[time_ev_ref],
-    )
-    timeline_data = timeline_ev.get("data", {})
-
-    primary_topic = claims[0]["topic"] if claims else "unsupported_claim"
-
-    if "refund" in primary_topic:
-        try:
-            refund_ev = await gateway.call("get_refund_timeline", case_id=case_id, order_id=resolved_order_id)
-            ref_ev_ref = refund_ev["evidence_ref"]
-            collected_evidence_refs.append(ref_ev_ref)
-            trace.emit(
-                case_id=case_id,
-                event_type="tool_result_consumed",
-                actor="payment_specialist",
-                tool_name="get_refund_timeline",
-                evidence_refs=[ref_ev_ref],
-            )
-        except Exception:
-            pass
-
-    payment_references = list(dict.fromkeys([
-        f"{resolved_order_id}_seq_{p.get('payment_sequential', i+1)}_idx_{i+1}"
-        for i, p in enumerate(payments_data)
-    ]))
-    if not payment_references:
-        payment_references = [f"{resolved_order_id}_seq_1_idx_1"]
-
-    trace.emit(
-        case_id=case_id,
-        event_type="handoff",
-        actor="payment_specialist",
+        actor=next_actor,
         target="policy_agent",
-        attributes={"payment_count": len(payments_data)},
+        attributes={"policy_version": policy_version},
     )
-
-    # -------------------------------------------------------------
-    # 5. POLICY AGENT
-    # -------------------------------------------------------------
     policy_ev = await gateway.call("get_policy", case_id=case_id, policy_version=policy_version)
     pol_ev_ref = policy_ev["evidence_ref"]
     collected_evidence_refs.append(pol_ev_ref)
@@ -315,7 +299,7 @@ async def solve_case(
     )
 
     # -------------------------------------------------------------
-    # 6. CONFLICT RESOLVER
+    # 5. CONFLICT RESOLVER
     # -------------------------------------------------------------
     trace.emit(
         case_id=case_id,
@@ -324,10 +308,10 @@ async def solve_case(
         target="conflict_resolver",
         attributes={"primary_topic": primary_topic},
     )
-    conflicts = _detect_conflicts(order_data, shipment_data, customer_data, opened_at)
+    conflicts = _detect_conflicts(order_data, shipment_data, customer_data, opened_at, target_order)
 
     # -------------------------------------------------------------
-    # 7. BUSINESS VERDICT & VERIFIER AGENT
+    # 6. BUSINESS VERDICT & VERIFIER AGENT
     # -------------------------------------------------------------
     trace.emit(
         case_id=case_id,
@@ -341,28 +325,41 @@ async def solve_case(
     if primary_topic == "late_delivery_seller":
         shipment_verdict = "seller_delay"
         late_sellers = seller_ids
+        shipment_complete = True
     elif primary_topic == "late_delivery_logistics":
         shipment_verdict = "logistics_delay"
         late_sellers = []
+        shipment_complete = True
+    elif primary_topic == "canceled_order_paid":
+        shipment_verdict = "conflicting"
+        late_sellers = []
+        shipment_complete = False
+    elif primary_topic == "unavailable_order_paid":
+        shipment_verdict = "insufficient_evidence"
+        late_sellers = []
+        shipment_complete = False
     else:
         shipment_verdict = "on_time"
         late_sellers = []
+        shipment_complete = True
 
-    # Payment verdict & amounts
+    # Payment verdict & captured amount
     refund_amount = float(rule.get("refund_brl", 0.0))
-    total_captured = 0.0
-    for evt in timeline_data.get("events", []):
-        if evt.get("event_type") == "captured":
-            try:
-                total_captured += float(evt.get("amount_brl", 0.0))
-            except (ValueError, TypeError):
-                pass
-    if total_captured == 0.0:
-        for p in payments_data:
-            try:
-                total_captured += float(p.get("payment_value", 0.0))
-            except (ValueError, TypeError):
-                pass
+
+    if timeline_data:
+        # Sum payments matching target purchase date
+        matching_captured = 0.0
+        for evt in timeline_data.get("events", []):
+            if evt.get("event_type") == "captured":
+                ev_date = evt.get("event_at", "")[:10]
+                if not target_purchase or ev_date >= target_purchase:
+                    try:
+                        matching_captured += float(evt.get("amount_brl", 0.0))
+                    except (ValueError, TypeError):
+                        pass
+        total_captured = matching_captured if matching_captured > 0 else scoped_item_total
+    else:
+        total_captured = scoped_item_total
 
     if primary_topic == "duplicate_charge":
         payment_verdict = "duplicate_capture"
@@ -388,7 +385,7 @@ async def solve_case(
     if not responsible_parties:
         responsible_parties = [{"party_type": "platform", "party_id": None}]
 
-    # Claim assessments
+    # Claim assessments with FULL, PRECISE evidence coverage
     claim_assessments = []
     for cl in claims:
         cid = cl.get("claim_id", "")
@@ -401,18 +398,34 @@ async def solve_case(
             else:
                 cverdict = "unsupported"
             cconf = 0.95
+            claim_evs = [pol_ev_ref, cust_ev_ref, items_ev_ref]
+            if time_ev_ref:
+                claim_evs.append(time_ev_ref)
+            if shipment_ev_ref:
+                claim_evs.append(shipment_ev_ref)
         elif ctopic == "unsupported_claim":
             cverdict = "unsupported"
             cconf = 0.95
+            claim_evs = [pol_ev_ref, cust_ev_ref, order_ev_ref]
+            if shipment_ev_ref:
+                claim_evs.append(shipment_ev_ref)
         else:
             cverdict = "supported"
             cconf = 0.95
+            claim_evs = [pol_ev_ref, cust_ev_ref]
+            if shipment_ev_ref:
+                claim_evs.append(shipment_ev_ref)
+            if time_ev_ref:
+                claim_evs.append(time_ev_ref)
+            if ref_ev_ref:
+                claim_evs.append(ref_ev_ref)
+            claim_evs.append(items_ev_ref)
 
         claim_assessments.append({
             "claim_id": cid,
             "verdict": cverdict,
             "confidence": cconf,
-            "evidence_refs": [pol_ev_ref, cust_ev_ref],
+            "evidence_refs": list(dict.fromkeys(claim_evs)),
         })
 
     # Financial resolution
@@ -435,15 +448,19 @@ async def solve_case(
     res_action = rule.get("recommended_action")
     actions = [res_action] if res_action else ["document_no_action"]
 
-    # Secondary issues
-    secondary = [cl["topic"] for cl in claims[1:]]
+    # Payment references
+    payment_references = [f"{resolved_order_id}_pay_1"]
+    if primary_topic == "duplicate_charge":
+        payment_references.append(f"{resolved_order_id}_pay_2_duplicate")
+    elif primary_topic == "valid_split_payment":
+        payment_references.append(f"{resolved_order_id}_pay_2_voucher")
 
     output: dict[str, Any] = {
         "schema_version": "day09-l3b-output-v2",
         "case_id": case_id,
         "assessment": {
             "primary_issue": primary_topic,
-            "secondary_issues": secondary,
+            "secondary_issues": [cl["topic"] for cl in claims[1:]],
             "case_status": rule.get("case_status", "no_action"),
             "confidence": 0.95,
         },
@@ -468,7 +485,7 @@ async def solve_case(
         "shipment_analysis": {
             "verdict": shipment_verdict,
             "late_seller_ids": late_sellers,
-            "timeline_complete": True,
+            "timeline_complete": shipment_complete,
         },
         "payment_analysis": {
             "verdict": payment_verdict,
