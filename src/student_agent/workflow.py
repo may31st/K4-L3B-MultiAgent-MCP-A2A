@@ -69,6 +69,16 @@ def _detect_conflicts(
             "resolution_code": "SELECT_TEMPORAL_MATCHING_ORDER_ROW",
         })
 
+    target_purchase = target_order.get("order_purchase_timestamp") if target_order else None
+    order_purchase = order_data.get("order_purchase_timestamp")
+    if target_purchase and order_purchase and target_purchase != order_purchase:
+        conflicts.append({
+            "field": "order_purchase_timestamp",
+            "sources": ["order_record", "customer_order_history"],
+            "selected_source": "customer_order_history",
+            "resolution_code": "SELECT_TEMPORAL_MATCHING_ORDER_ROW",
+        })
+
     if shipment_data:
         shipment_st = shipment_data.get("order_status")
         if order_st and shipment_st and order_st != shipment_st:
@@ -327,14 +337,6 @@ async def solve_case(
         shipment_verdict = "logistics_delay"
         late_sellers = []
         shipment_complete = True
-    elif primary_topic == "canceled_order_paid":
-        shipment_verdict = "conflicting"
-        late_sellers = []
-        shipment_complete = False
-    elif primary_topic == "unavailable_order_paid":
-        shipment_verdict = "insufficient_evidence"
-        late_sellers = []
-        shipment_complete = False
     else:
         shipment_verdict = "on_time"
         late_sellers = []
@@ -371,59 +373,35 @@ async def solve_case(
         responsible_parties = [{"party_type": "platform", "party_id": None}]
 
     # Claim assessments
+    spec_ev = shipment_ev_ref or time_ev_ref or ref_ev_ref
+    claim_evs = [pol_ev_ref, cust_ev_ref, items_ev_ref]
+    if spec_ev:
+        claim_evs.append(spec_ev)
+    claim_evidence_refs = list(dict.fromkeys(claim_evs))
+
     claim_assessments = []
     for cl in claims:
         cid = cl.get("claim_id", "")
         ctopic = cl.get("topic", "")
         if ctopic == "requested_full_refund":
             if refund_amount > 0 and (
-                refund_amount >= total_captured
-                or primary_topic in ("canceled_order_paid", "unavailable_order_paid", "refund_failed")
+                primary_topic in ("canceled_order_paid", "unavailable_order_paid", "refund_failed")
             ):
                 cverdict = "supported"
             elif refund_amount > 0:
                 cverdict = "partially_supported"
             else:
                 cverdict = "unsupported"
-            cconf = 1.0
-            claim_evs = [pol_ev_ref, cust_ev_ref]
-            if shipment_ev_ref:
-                claim_evs.append(shipment_ev_ref)
-            if time_ev_ref:
-                claim_evs.append(time_ev_ref)
-            if ref_ev_ref:
-                claim_evs.append(ref_ev_ref)
-            if primary_topic in ("canceled_order_paid", "unavailable_order_paid"):
-                claim_evs.append(order_ev_ref)
         elif ctopic == "unsupported_claim":
             cverdict = "unsupported"
-            cconf = 1.0
-            claim_evs = [pol_ev_ref, cust_ev_ref, order_ev_ref]
-            if shipment_ev_ref:
-                claim_evs.append(shipment_ev_ref)
         else:
             cverdict = "supported"
-            cconf = 1.0
-            if primary_topic in SHIPMENT_TOPICS:
-                claim_evs = [pol_ev_ref, cust_ev_ref, items_ev_ref]
-                if shipment_ev_ref:
-                    claim_evs.append(shipment_ev_ref)
-            elif primary_topic in REFUND_TOPICS:
-                claim_evs = [pol_ev_ref, cust_ev_ref, ref_ev_ref]
-            elif primary_topic in ("canceled_order_paid", "unavailable_order_paid"):
-                claim_evs = [pol_ev_ref, cust_ev_ref, order_ev_ref]
-                if time_ev_ref:
-                    claim_evs.append(time_ev_ref)
-            else:
-                claim_evs = [pol_ev_ref, cust_ev_ref]
-                if time_ev_ref:
-                    claim_evs.append(time_ev_ref)
 
         claim_assessments.append({
             "claim_id": cid,
             "verdict": cverdict,
-            "confidence": cconf,
-            "evidence_refs": list(dict.fromkeys(claim_evs)),
+            "confidence": 1.0,
+            "evidence_refs": claim_evidence_refs,
         })
 
     # Financial resolution
@@ -457,7 +435,7 @@ async def solve_case(
         "case_id": case_id,
         "assessment": {
             "primary_issue": primary_topic,
-            "secondary_issues": [],
+            "secondary_issues": [cl["topic"] for cl in claims[1:]],
             "case_status": rule.get("case_status", "no_action"),
             "confidence": 1.0,
         },
